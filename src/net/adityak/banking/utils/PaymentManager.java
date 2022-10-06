@@ -16,7 +16,7 @@ public class PaymentManager {
         if (paymentInterface == null) {
             try {
                 paymentInterface = (PaymentInterface)
-                        Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/wepay");
+                        Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/" + Config.RMI_NAME);
             } catch (NotBoundException | MalformedURLException | RemoteException e) {
                 e.printStackTrace();
             }

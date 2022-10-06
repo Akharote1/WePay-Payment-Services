@@ -1,5 +1,10 @@
 package net.adityak.banking.rmi;
 
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.RedisConnectionException;
+import io.lettuce.core.RedisURI;
+import io.lettuce.core.api.StatefulRedisConnection;
+import net.adityak.banking.Config;
 import net.adityak.banking.models.Transaction;
 import net.adityak.banking.models.User;
 import net.adityak.banking.rmi.response.AuthResponse;
@@ -9,18 +14,44 @@ import net.adityak.banking.rmi.response.UserResponse;
 import net.adityak.banking.utils.Database;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
+import java.net.MalformedURLException;
+import java.rmi.Naming;
+import java.rmi.NotBoundException;
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
 import java.sql.*;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static net.adityak.banking.utils.Utils.formatPhoneNumber;
 
-public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface {
-    public PaymentImpl() throws RemoteException {
+public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface, TimeInterface {
+    StatefulRedisConnection<String, String> connection;
+    boolean isSlave;
+    int slaveId, slaveCount;
+    ArrayList<TimeInterface> slaves = new ArrayList<>();
+
+    public PaymentImpl(int slaveId, int slaveCount) throws RemoteException {
         super();
+
+        this.isSlave = slaveId != -1;
+        this.slaveId = slaveId;
+        this.slaveCount = slaveCount;
+
+        if (Config.REDIS_ENABLED) {
+            RedisClient redisClient = RedisClient.create(RedisURI.create(Config.REDIS_URI));
+            try {
+                connection = redisClient.connect();
+            } catch (RedisConnectionException e) {
+                System.out.println("Redis is offline");
+            }
+        }
     }
 
     @Override
@@ -237,4 +268,66 @@ public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface
         return new TransactionsResponse(Responses.ERROR, null, "An error occurred");
     }
 
+    public long getSystemTime() {
+        return Instant.now().toEpochMilli();
+    }
+
+    @Override
+    public void connectSlave(String rmiName) throws RemoteException {
+        System.out.println("Slave connection request: " + rmiName);
+        try {
+            TimeInterface slave = (TimeInterface)
+                    Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/" + rmiName);
+            slaves.add(slave);
+
+            if (slaves.size() < slaveCount) {
+                System.out.println("Waiting for " + (slaveCount - slaves.size()) + " slaves to connect");
+            } else if (slaves.size() == slaveCount) {
+                System.out.println("Starting Clock Synchronization Process");
+                Timer timer = new Timer();
+                timer.schedule(new ClockSynchronizationTask(), 0, 100);
+            }
+
+            System.out.println();
+        } catch (NotBoundException | MalformedURLException | RemoteException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void syncSystemTime(long updatedTime) throws RemoteException {
+        System.out.println("Received Synchronized Time: "
+                + LocalDateTime.ofInstant(Instant.ofEpochMilli(updatedTime), ZoneId.systemDefault()));
+    }
+
+    class ClockSynchronizationTask extends TimerTask {
+
+        @Override
+        public void run() {
+            long timeDiffSum = 0;
+            long currentTime = Instant.now().toEpochMilli();
+
+            for (int i = 0; i < slaves.size(); i++) {
+                try {
+                    timeDiffSum += (slaves.get(i).getSystemTime() - currentTime);
+                } catch (RemoteException e) {
+                    e.printStackTrace();
+                }
+            }
+
+            long timeDiffAvg = timeDiffSum / (slaves.size() + 1);
+            long newTime = currentTime + timeDiffAvg;
+
+            System.out.println("Synchronized Time: "
+                    + LocalDateTime.ofInstant(Instant.ofEpochMilli(newTime), ZoneId.systemDefault()));
+
+            slaves.forEach(slave -> {
+                try {
+                    slave.syncSystemTime(newTime);
+                } catch (RemoteException e) {
+                    e.printStackTrace();
+                }
+            });
+        }
+    }
 }

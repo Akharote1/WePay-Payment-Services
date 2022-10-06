@@ -11,6 +11,8 @@ public class Config {
     public static final String RMI_NAME = "wepay";
 
     public static final String KAFKA_SERVER = "172.25.90.226:9092";
+
+    public static final boolean REDIS_ENABLED = false;
     public static final String REDIS_URI = "redis://172.25.90.226:6379";
 
 }
