@@ -1,6 +1,7 @@
 package net.adityak.banking.utils;
 
 import net.adityak.banking.Config;
+import net.adityak.banking.rmi.BalancerInterface;
 import net.adityak.banking.rmi.PaymentInterface;
 
 import java.net.MalformedURLException;
@@ -15,9 +16,23 @@ public class PaymentManager {
     public static PaymentInterface get() {
         if (paymentInterface == null) {
             try {
+                BalancerInterface balancerInterface = (BalancerInterface)
+                        Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/" + Config.RMI_NAME + "balancer");
+
+                int nodeId = balancerInterface.getNextNode();
+
+                if (nodeId == -1) {
+                    System.out.println("No active servers found");
+                    return null;
+                }
+
                 paymentInterface = (PaymentInterface)
-                        Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/" + Config.RMI_NAME);
+                        Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/"
+                                + Config.RMI_NAME + nodeId);
+
+                System.out.println("Connected to Server " + nodeId);
             } catch (NotBoundException | MalformedURLException | RemoteException e) {
+                System.out.println("Unable to connect to load balancer");
                 e.printStackTrace();
             }
         }

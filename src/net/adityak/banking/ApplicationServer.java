@@ -11,45 +11,40 @@ import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 
 public class ApplicationServer {
+    public static Registry registry;
+
     public static void main(String[] args) throws RemoteException {
-        // Slave ID if slave, -1 if master
-        int slaveId = getSlaveId(args);
-        int slaveCount = getSlaveCount(args);
-        boolean isSlave = slaveId != -1;
+        int nodeId = getNodeId(args);
+        int nodeCount = getNodeCount(args);
 
-        Registry registry;
-
-        if (isSlave) {
+        if (!shouldCreateRegistry(args)) {
             registry = LocateRegistry.getRegistry(Config.RMI_PORT);
         } else {
             registry = LocateRegistry.createRegistry(Config.RMI_PORT);
         }
 
-        String rmiName = Config.RMI_NAME + (isSlave
-                ? slaveId
-                : "");
+        String rmiName = Config.RMI_NAME + nodeId;
 
-        registry.rebind(rmiName, new PaymentImpl(slaveId, slaveCount));
+        PaymentImpl impl = new PaymentImpl(nodeId, nodeCount);
+        registry.rebind(rmiName, impl);
 
-        System.out.println("WePay RMI server (" + (!isSlave ? "Master" : "Slave " + slaveId)
-                + ") running on port " + Config.RMI_PORT);
-
-        if (!isSlave) {
-            System.out.println("Waiting for " + slaveCount + " slaves to connect.\n");
-        } else {
-            try {
-                TimeInterface timeInterface = (TimeInterface)
-                        Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/wepay");
-                timeInterface.connectSlave(rmiName);
-            } catch (NotBoundException | MalformedURLException | RemoteException e) {
-                e.printStackTrace();
-            }
-        }
+        System.out.println("WePay RMI server (Node " + nodeId + ") running on port " + Config.RMI_PORT);
+        impl.electionController.startElection();
+        impl.mutualExclusionController.showEntryMenu();
     }
 
-    public static int getSlaveId(String[] args) {
+    public static boolean shouldCreateRegistry(String[] args) {
         for (int i = 0; i < args.length; i++) {
-            if (args[i].equalsIgnoreCase("--slave")) {
+            if (args[i].equalsIgnoreCase("--create-registry")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static int getNodeId(String[] args) {
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].equalsIgnoreCase("--id")) {
                 if (args.length == i + 1) return -1;
                 return Integer.parseInt(args[i + 1]);
             }
@@ -57,9 +52,9 @@ public class ApplicationServer {
         return -1;
     }
 
-    public static int getSlaveCount(String[] args) {
+    public static int getNodeCount(String[] args) {
         for (int i = 0; i < args.length; i++) {
-            if (args[i].equalsIgnoreCase("--slaves")) {
+            if (args[i].equalsIgnoreCase("--nodes")) {
                 if (args.length == i + 1) return -1;
                 return Integer.parseInt(args[i + 1]);
             }

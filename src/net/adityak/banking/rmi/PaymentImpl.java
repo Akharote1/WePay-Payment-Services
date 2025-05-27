@@ -12,6 +12,9 @@ import net.adityak.banking.rmi.response.PaymentResponse;
 import net.adityak.banking.rmi.response.TransactionsResponse;
 import net.adityak.banking.rmi.response.UserResponse;
 import net.adityak.banking.utils.Database;
+import net.adityak.banking.utils.ElectionController;
+import net.adityak.banking.utils.LogController;
+import net.adityak.banking.utils.MutualExclusionController;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 import java.net.MalformedURLException;
@@ -31,18 +34,30 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static net.adityak.banking.utils.Utils.formatPhoneNumber;
 
-public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface, TimeInterface {
-    StatefulRedisConnection<String, String> connection;
-    boolean isSlave;
-    int slaveId, slaveCount;
-    ArrayList<TimeInterface> slaves = new ArrayList<>();
+public class PaymentImpl extends UnicastRemoteObject
+        implements PaymentInterface, TimeInterface, ElectionInterface, LogInterface, MutualExclusionInterface {
 
-    public PaymentImpl(int slaveId, int slaveCount) throws RemoteException {
+    StatefulRedisConnection<String, String> connection;
+
+    public ElectionController electionController;
+    public MutualExclusionController mutualExclusionController;
+    public LogController logController;
+
+    boolean isNode;
+    int nodeId, nodeCount;
+
+    ArrayList<TimeInterface> nodes = new ArrayList<>();
+
+    public PaymentImpl(int nodeId, int nodeCount) throws RemoteException {
         super();
 
-        this.isSlave = slaveId != -1;
-        this.slaveId = slaveId;
-        this.slaveCount = slaveCount;
+        this.isNode = nodeId != -1;
+        this.nodeId = nodeId;
+        this.nodeCount = nodeCount;
+
+        electionController = new ElectionController(nodeCount, nodeId);
+        mutualExclusionController = new MutualExclusionController(nodeCount, nodeId);
+        logController = new LogController(nodeCount, nodeId);
 
         if (Config.REDIS_ENABLED) {
             RedisClient redisClient = RedisClient.create(RedisURI.create(Config.REDIS_URI));
@@ -96,6 +111,8 @@ public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface
                     statement.setString(2, phoneNumber);
                     statement.execute();
 
+                    logController.log("User " + result.getString("user_id") + " logged in");
+
                     return new AuthResponse(Responses.SUCCESS, sessionToken);
                 }
 
@@ -119,17 +136,20 @@ public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface
                             VALUES (?, ?, ?, ?, ?, ?)""");
 
             String sessionToken = UUID.randomUUID().toString();
+            String userId = UUID.randomUUID().toString();
 
             BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
 
             statement.setString(1, name);
             statement.setString(2, formatPhoneNumber(phoneNumber));
-            statement.setString(3, UUID.randomUUID().toString());
+            statement.setString(3, userId);
             statement.setString(4, sessionToken);
             statement.setString(5, encoder.encode(passcode));
             statement.setString(6, email);
 
             statement.execute();
+
+            logController.log("User " + userId + " registered");
 
             return new AuthResponse(Responses.SUCCESS, sessionToken);
         } catch (SQLException e) {
@@ -220,6 +240,10 @@ public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface
 
             conn.commit();
 
+            logController.log("Transfer of " + String.format("%.2f", amount / 100.0f) + " from "
+                    + sender.getString("user_id") + " to "
+                    + receiver.getString("user_id"));
+
             return new PaymentResponse(Responses.SUCCESS);
         } catch (SQLException e) {
             e.printStackTrace();
@@ -268,21 +292,26 @@ public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface
         return new TransactionsResponse(Responses.ERROR, null, "An error occurred");
     }
 
+    @Override
+    public void ping() throws RemoteException{
+
+    }
+
     public long getSystemTime() {
         return Instant.now().toEpochMilli();
     }
 
     @Override
     public void connectSlave(String rmiName) throws RemoteException {
-        System.out.println("Slave connection request: " + rmiName);
+        System.out.println("Node connection request: " + rmiName);
         try {
-            TimeInterface slave = (TimeInterface)
+            TimeInterface node = (TimeInterface)
                     Naming.lookup("rmi://localhost:" + Config.RMI_PORT + "/" + rmiName);
-            slaves.add(slave);
+            nodes.add(node);
 
-            if (slaves.size() < slaveCount) {
-                System.out.println("Waiting for " + (slaveCount - slaves.size()) + " slaves to connect");
-            } else if (slaves.size() == slaveCount) {
+            if (nodes.size() < nodeCount) {
+                System.out.println("Waiting for " + (nodeCount - nodes.size()) + " nodes to connect");
+            } else if (nodes.size() == nodeCount) {
                 System.out.println("Starting Clock Synchronization Process");
                 Timer timer = new Timer();
                 timer.schedule(new ClockSynchronizationTask(), 0, 100);
@@ -300,6 +329,33 @@ public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface
                 + LocalDateTime.ofInstant(Instant.ofEpochMilli(updatedTime), ZoneId.systemDefault()));
     }
 
+    @Override
+    public void electionPing(int fromNode) throws RemoteException {
+//        System.out.println("[Election] Ping from node " + fromNode);
+        electionController.startElection();
+    }
+
+    @Override
+    public void onMasterUpdate(int newMasterNode) throws RemoteException {
+//        System.out.println("[Election] New Coordinator: " + newMasterNode);
+        electionController.currentCoordinator = newMasterNode;
+    }
+
+    @Override
+    public void criticalSectionRequest(int fromNode, long timestamp) throws RemoteException {
+        mutualExclusionController.handleRequest(fromNode, timestamp);
+    }
+
+    @Override
+    public void criticalSectionReply(int fromNode) throws RemoteException {
+        mutualExclusionController.handleReply(fromNode);
+    }
+
+    @Override
+    public void log(int sourceNode, String message) throws RemoteException {
+        logController.handleLog(sourceNode, message);
+    }
+
     class ClockSynchronizationTask extends TimerTask {
 
         @Override
@@ -307,23 +363,23 @@ public class PaymentImpl extends UnicastRemoteObject implements PaymentInterface
             long timeDiffSum = 0;
             long currentTime = Instant.now().toEpochMilli();
 
-            for (int i = 0; i < slaves.size(); i++) {
+            for (int i = 0; i < nodes.size(); i++) {
                 try {
-                    timeDiffSum += (slaves.get(i).getSystemTime() - currentTime);
+                    timeDiffSum += (nodes.get(i).getSystemTime() - currentTime);
                 } catch (RemoteException e) {
                     e.printStackTrace();
                 }
             }
 
-            long timeDiffAvg = timeDiffSum / (slaves.size() + 1);
+            long timeDiffAvg = timeDiffSum / (nodes.size() + 1);
             long newTime = currentTime + timeDiffAvg;
 
             System.out.println("Synchronized Time: "
                     + LocalDateTime.ofInstant(Instant.ofEpochMilli(newTime), ZoneId.systemDefault()));
 
-            slaves.forEach(slave -> {
+            nodes.forEach(node -> {
                 try {
-                    slave.syncSystemTime(newTime);
+                    node.syncSystemTime(newTime);
                 } catch (RemoteException e) {
                     e.printStackTrace();
                 }

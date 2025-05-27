@@ -26,4 +26,6 @@ public interface PaymentInterface extends Remote {
                                     String note) throws RemoteException;
 
     TransactionsResponse getTransactions(String sessionToken) throws RemoteException;
+
+    void ping() throws RemoteException;
 }
